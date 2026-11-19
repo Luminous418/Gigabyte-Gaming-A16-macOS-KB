@@ -1,0 +1,849 @@
+#!/usr/bin/env python3
+"""Control the RGB keyboard backlight of the GIGABYTE GAMING A16 on macOS.
+
+Port of https://github.com/Luminous418/Gigabyte-Gaming-A16-Linux-KB-Drivers
+
+The A16 keyboard is a USB-HID device (VID 0414, PID 8105 or 8104). One of its
+HID interfaces exposes the Microsoft HID LampArray protocol (Usage Page 0x59,
+"Lighting and Illumination"). That interface has no LED class entry, so nothing
+lights it up on a cold boot unless host software sends the LampArray feature
+reports. On Windows, Gigabyte Control Center / GiMate does that; Linux and
+macOS send nothing, so the backlight stays off.
+
+The Linux version talks to /dev/hidrawN with HIDIOCSFEATURE / HIDIOCGFEATURE.
+macOS has no hidraw, so this port uses IOKit's HID API instead:
+
+    IOHIDDeviceGetReport(dev, kIOHIDReportTypeFeature, reportID, buf, &len)
+    IOHIDDeviceSetReport(dev, kIOHIDReportTypeFeature, reportID, buf, len)
+
+NOTE: unlike hidraw, IOKit takes the report ID as a separate argument and the
+data buffer must NOT contain it. That is the only real semantic difference.
+
+Report map (from the device report descriptor):
+  0x01  LampArrayAttributesReport (read)  -> LampCount, kind, bbox
+  0x05  LampRangeUpdateReport (write)     -> set a lamp range to one RGB + intensity
+  0x06  LampArrayControlReport (write)    -> AutonomousMode
+
+Requires: python3 (system one is fine), no kext, no SIP changes, no root.
+"""
+
+import argparse
+import ctypes
+import os
+import struct
+import sys
+import time
+from ctypes import (
+    POINTER,
+    byref,
+    c_char_p,
+    c_int,
+    c_int64,
+    c_long,
+    c_uint8,
+    c_uint32,
+    c_void_p,
+)
+
+# ---------------------------------------------------------------------------
+# Constants (mirrors of the C enums)
+# ---------------------------------------------------------------------------
+
+VENDOR_ID = 0x0414
+LAMPARRAY_USAGE_PAGE = 0x59  # "Lighting and Illumination"
+LAMPARRAY_USAGE = 0x01       # "LampArray"
+
+ATTR_REPORT_ID = 0x01
+RANGE_REPORT_ID = 0x05
+CONTROL_REPORT_ID = 0x06
+
+# Feature report sizes decoded from the device descriptor (327 bytes), each
+# INCLUDING the leading report ID byte:
+#   0x01 LampArrayAttributes  1 + 2 + 5*4 = 23
+#   0x02 LampAttributesRequest 1 + 2      =  3
+#   0x03 LampAttributesResponse 1 + 2 + 5*4 + 6 = 29
+#   0x04 MultiZoneUpdate       1 + 2 + 16 + 32 = 51  (= MaxFeatureReportSize)
+#   0x05 LampRangeUpdate       1 + 1 + 4 + 4  = 10
+#   0x06 LampArrayControl      1 + 1          =  2
+REPORT_SIZES = {1: 23, 2: 3, 3: 29, 4: 51, 5: 10, 6: 2}
+ATTR_REPORT_SIZE = REPORT_SIZES[ATTR_REPORT_ID]
+
+kIOHIDReportTypeFeature = 2
+kIOHIDOptionsTypeNone = 0
+kCFStringEncodingUTF8 = 0x08000100
+kCFNumberSInt64Type = 4
+
+# IOReturn codes we care about
+IORETURN_SUCCESS = 0
+IORETURN_ERRORS = {
+    0xE00002C5: "kIOReturnExclusiveAccess (another process owns the device)",
+    0xE00002C1: "kIOReturnNotPermitted",
+    0xE00002D8: "kIOReturnUnsupported (device does not accept this report)",
+    0xE00002BC: "kIOReturnError",
+    0xE00002BD: "kIOReturnNoMemory",
+    0xE00002C7: "kIOReturnNotOpen (call IOHIDDeviceOpen first)",
+    0xE00002D6: "kIOReturnBadArgument (report ID or size rejected)",
+    0xE00002EB: "kIOReturnAborted",
+}
+
+LAMP_KINDS = {
+    0: "Undefined",
+    1: "Keyboard",
+    2: "Mouse",
+    3: "GameController",
+    4: "Peripheral",
+    5: "Scene",
+    6: "Notification",
+    7: "Chassis",
+    8: "Wearable",
+    9: "Furniture",
+}
+
+# ---------------------------------------------------------------------------
+# Config (same path/semantics as the Linux tool, so docs carry over)
+# ---------------------------------------------------------------------------
+
+CONFIG_PATH = os.environ.get(
+    "GIGABYTE_KBD_CONFIG",
+    os.path.join(
+        os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+        "gigabyte-kbd.conf",
+    ),
+)
+DEFAULT_COLOR = "ffffff"
+DEFAULT_INTENSITY = 255
+STARTUP_COLOR = "00aaff"
+STARTUP_INTENSITY = 255
+
+# ---------------------------------------------------------------------------
+# CoreFoundation / IOKit bindings
+# ---------------------------------------------------------------------------
+
+_CF = ctypes.CDLL(
+    "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+)
+_IOKIT = ctypes.CDLL("/System/Library/Frameworks/IOKit.framework/IOKit")
+
+_CF.CFStringCreateWithCString.restype = c_void_p
+_CF.CFStringCreateWithCString.argtypes = [c_void_p, c_char_p, c_uint32]
+
+_CF.CFStringGetCString.restype = c_uint8
+_CF.CFStringGetCString.argtypes = [c_void_p, c_char_p, c_long, c_uint32]
+
+_CF.CFNumberGetValue.restype = c_uint8
+_CF.CFNumberGetValue.argtypes = [c_void_p, c_int, c_void_p]
+
+_CF.CFNumberGetTypeID.restype = ctypes.c_ulong
+_CF.CFNumberGetTypeID.argtypes = []
+_CF.CFStringGetTypeID.restype = ctypes.c_ulong
+_CF.CFStringGetTypeID.argtypes = []
+_CF.CFGetTypeID.restype = ctypes.c_ulong
+_CF.CFGetTypeID.argtypes = [c_void_p]
+_CF.CFRelease.restype = None
+_CF.CFRelease.argtypes = [c_void_p]
+
+_CF.CFDataGetLength.restype = c_long
+_CF.CFDataGetLength.argtypes = [c_void_p]
+_CF.CFDataGetBytePtr.restype = POINTER(c_uint8)
+_CF.CFDataGetBytePtr.argtypes = [c_void_p]
+
+_IOKIT.IOServiceMatching.restype = c_void_p
+_IOKIT.IOServiceMatching.argtypes = [c_char_p]
+
+_IOKIT.IOServiceGetMatchingServices.restype = c_int
+_IOKIT.IOServiceGetMatchingServices.argtypes = [c_uint32, c_void_p, POINTER(c_uint32)]
+
+_IOKIT.IOIteratorNext.restype = c_uint32
+_IOKIT.IOIteratorNext.argtypes = [c_uint32]
+
+_IOKIT.IOObjectRelease.restype = c_int
+_IOKIT.IOObjectRelease.argtypes = [c_uint32]
+
+_IOKIT.IOHIDDeviceCreate.restype = c_void_p
+_IOKIT.IOHIDDeviceCreate.argtypes = [c_void_p, c_uint32]
+
+_IOKIT.IOHIDDeviceOpen.restype = c_int
+_IOKIT.IOHIDDeviceOpen.argtypes = [c_void_p, c_uint32]
+
+_IOKIT.IOHIDDeviceClose.restype = c_int
+_IOKIT.IOHIDDeviceClose.argtypes = [c_void_p, c_uint32]
+
+_IOKIT.IOHIDDeviceGetProperty.restype = c_void_p
+_IOKIT.IOHIDDeviceGetProperty.argtypes = [c_void_p, c_void_p]
+
+_IOKIT.IOHIDDeviceGetReport.restype = c_int
+_IOKIT.IOHIDDeviceGetReport.argtypes = [
+    c_void_p, c_int, c_long, POINTER(c_uint8), POINTER(c_long)
+]
+
+_IOKIT.IOHIDDeviceSetReport.restype = c_int
+_IOKIT.IOHIDDeviceSetReport.argtypes = [
+    c_void_p, c_int, c_long, POINTER(c_uint8), c_long
+]
+
+
+def _cfstr(text):
+    return _CF.CFStringCreateWithCString(None, text.encode(), kCFStringEncodingUTF8)
+
+
+def _prop_raw(dev, key):
+    """Get a device property. NOTE: IOHIDDeviceGetProperty follows the
+    CoreFoundation 'Get' rule, so the returned ref is NOT owned by us and must
+    NOT be released. Releasing it corrupts the CF heap (hard-to-trace SIGSEGV).
+    """
+    cfkey = _cfstr(key)
+    try:
+        return _IOKIT.IOHIDDeviceGetProperty(dev, cfkey)
+    finally:
+        # The key itself came from a 'Create' function, so we do own that one.
+        _CF.CFRelease(cfkey)
+
+
+def _prop_int(dev, key):
+    ref = _prop_raw(dev, key)
+    if not ref:
+        return None
+    if _CF.CFGetTypeID(ref) != _CF.CFNumberGetTypeID():
+        return None
+    out = c_int64(0)
+    if not _CF.CFNumberGetValue(ref, kCFNumberSInt64Type, byref(out)):
+        return None
+    return out.value
+
+
+def _prop_str(dev, key):
+    ref = _prop_raw(dev, key)
+    if not ref:
+        return None
+    if _CF.CFGetTypeID(ref) != _CF.CFStringGetTypeID():
+        return None
+    buf = ctypes.create_string_buffer(512)
+    if not _CF.CFStringGetCString(ref, buf, len(buf), kCFStringEncodingUTF8):
+        return None
+    return buf.value.decode("utf-8", "replace")
+
+
+def _prop_data(dev, key):
+    ref = _prop_raw(dev, key)
+    if not ref:
+        return None
+    n = _CF.CFDataGetLength(ref)
+    if n <= 0:
+        return None
+    ptr = _CF.CFDataGetBytePtr(ref)
+    return bytes(ptr[i] for i in range(n))
+
+
+
+def _describe_ior(rc):
+    name = IORETURN_ERRORS.get(rc & 0xFFFFFFFF)
+    if rc == IORETURN_SUCCESS:
+        return "success"
+    return "{} (0x{:08X})".format(name or "unknown error", rc & 0xFFFFFFFF)
+
+
+# ---------------------------------------------------------------------------
+# Device discovery
+# ---------------------------------------------------------------------------
+
+
+def iter_hid_devices():
+    """Yield (IOHIDDeviceRef, io_service_t) for every IOHIDDevice on the bus."""
+    iterator = c_uint32(0)
+    matching = _IOKIT.IOServiceMatching(b"IOHIDDevice")
+    if not matching:
+        sys.exit("Error: IOServiceMatching(IOHIDDevice) failed")
+    kr = _IOKIT.IOServiceGetMatchingServices(0, matching, byref(iterator))
+    if kr != 0:
+        sys.exit("Error: IOServiceGetMatchingServices failed ({})".format(kr))
+    try:
+        while True:
+            service = _IOKIT.IOIteratorNext(iterator)
+            if not service:
+                break
+            dev = _IOKIT.IOHIDDeviceCreate(None, service)
+            if not dev:
+                _IOKIT.IOObjectRelease(service)
+                continue
+            try:
+                yield dev, service
+            finally:
+                _CF.CFRelease(dev)
+                _IOKIT.IOObjectRelease(service)
+    finally:
+        _IOKIT.IOObjectRelease(iterator)
+
+
+def find_lamparray(vid=VENDOR_ID, pid=None, verbose=False):
+    """Return a *retained* io_service_t for the GIGABYTE LampArray interface.
+
+    We match on VendorID + PrimaryUsagePage 0x59 + PrimaryUsage 1, which is the
+    macOS equivalent of the Linux tool matching VID + the b'\\x05\\x59' bytes of
+    the report descriptor.
+
+    The returned io_service_t is retained: the caller owns it and must release
+    it with IOObjectRelease().
+    """
+    iterator = c_uint32(0)
+    matching = _IOKIT.IOServiceMatching(b"IOHIDDevice")
+    if not matching:
+        sys.exit("Error: IOServiceMatching(IOHIDDevice) failed")
+    kr = _IOKIT.IOServiceGetMatchingServices(0, matching, byref(iterator))
+    if kr != 0:
+        sys.exit("Error: IOServiceGetMatchingServices failed ({})".format(kr))
+
+    match_count = 0
+    matched_service = None
+    try:
+        while True:
+            service = _IOKIT.IOIteratorNext(iterator)
+            if not service:
+                break
+
+            dev = _IOKIT.IOHIDDeviceCreate(None, service)
+            if not dev:
+                _IOKIT.IOObjectRelease(service)
+                continue
+
+            try:
+                is_match = (
+                    _prop_int(dev, "VendorID") == vid
+                    and (pid is None or _prop_int(dev, "ProductID") == pid)
+                    and _prop_int(dev, "PrimaryUsagePage") == LAMPARRAY_USAGE_PAGE
+                    and _prop_int(dev, "PrimaryUsage") == LAMPARRAY_USAGE
+                )
+            finally:
+                _CF.CFRelease(dev)
+
+            if is_match:
+                match_count += 1
+                if matched_service is None:
+                    matched_service = service  # keep this one retained
+                else:
+                    _IOKIT.IOObjectRelease(service)
+            else:
+                _IOKIT.IOObjectRelease(service)
+    finally:
+        _IOKIT.IOObjectRelease(iterator)
+
+    if verbose and match_count > 1:
+        print("Note: {} LampArray interfaces found, using the first".format(
+            match_count))
+    return matched_service
+
+
+
+def _wanted_ids():
+    cfg = read_config()
+    try:
+        vid = int(str(cfg.get("vendor_id") or "0414"), 16)
+    except ValueError:
+        vid = VENDOR_ID
+    raw_pid = str(cfg.get("product_id") or "").strip().lstrip("#")
+    pid = None
+    if raw_pid:
+        try:
+            pid = int(raw_pid, 16)
+        except ValueError:
+            pid = None
+    return vid, pid
+
+
+# ---------------------------------------------------------------------------
+# LampArray controller
+# ---------------------------------------------------------------------------
+
+
+class LampArray:
+    def __init__(self, vid=VENDOR_ID, pid=None, verbose=False, wait=0):
+        service = find_lamparray(vid, pid, verbose=verbose)
+        # At login the USB device may not be enumerated yet, so allow retrying.
+        deadline = time.time() + max(0, wait)
+        while service is None and time.time() < deadline:
+            time.sleep(0.5)
+            service = find_lamparray(vid, pid, verbose=False)
+        if service is None:
+            sys.exit(
+                "Error: GIGABYTE LampArray interface ({:04x}:{}) not found.\n"
+                "  Check with: gigabyte-kbd detect --list".format(
+                    vid, "{:04x}".format(pid) if pid else "any"
+                )
+            )
+        self.service = service
+        self.dev = _IOKIT.IOHIDDeviceCreate(None, service)
+        if not self.dev:
+            _IOKIT.IOObjectRelease(service)
+            sys.exit("Error: could not create IOHIDDevice reference")
+        self.opened = False
+        self._released = False
+        self.set_convention = os.environ.get("GIGABYTE_KBD_CONVENTION") or None
+
+    def open(self):
+        rc = _IOKIT.IOHIDDeviceOpen(self.dev, kIOHIDOptionsTypeNone)
+        if rc != IORETURN_SUCCESS:
+            sys.exit(
+                "Error: IOHIDDeviceOpen failed: {}\n"
+                "  Try running with sudo, or check that no other app owns the "
+                "keyboard's lighting interface.".format(_describe_ior(rc))
+            )
+        self.opened = True
+        return self
+
+    def close(self):
+        if self.opened:
+            _IOKIT.IOHIDDeviceClose(self.dev, kIOHIDOptionsTypeNone)
+            self.opened = False
+        if not self._released:
+            self._released = True
+            if self.dev:
+                _CF.CFRelease(self.dev)
+                self.dev = None
+            if self.service:
+                _IOKIT.IOObjectRelease(self.service)
+                self.service = 0
+
+
+    def __enter__(self):
+        return self.open()
+
+    def __exit__(self, *exc):
+        self.close()
+
+    # -- raw transfers ----------------------------------------------------
+
+    def get_report(self, report_id, size=None, verbose=False):
+        """Fetch a feature report; returns the payload WITHOUT the report ID.
+
+        Note: macOS hands back the whole report including the ID byte at [0]
+        (verified on this keyboard: size 22 is rejected with 0xE00002E8 while
+        size 23 succeeds and returns 01 01 00 e0 2e ...). So the buffer size we
+        request must be the full report size, and we strip [0] afterwards.
+        """
+        size = size or REPORT_SIZES.get(report_id)
+        candidates = []
+        for candidate in (size, max(REPORT_SIZES.values()), 64):
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+
+        last_err = None
+        for candidate in candidates:
+            buf = (c_uint8 * candidate)()
+            length = c_long(candidate)
+            rc = _IOKIT.IOHIDDeviceGetReport(
+                self.dev, kIOHIDReportTypeFeature, report_id, buf, byref(length)
+            )
+            if verbose:
+                print("  GetReport id=0x{:02x} size={} -> {} (returned {})".format(
+                    report_id, candidate, _describe_ior(rc), length.value))
+            if rc == IORETURN_SUCCESS:
+                data = bytes(buf[i] for i in range(length.value))
+                # Strip the report ID only when the whole report came back.
+                if data and data[0] == report_id and len(data) == candidate:
+                    data = data[1:]
+                return data
+            last_err = rc
+
+        raise RuntimeError("GetReport(0x{:02x}) failed: {}".format(
+            report_id, _describe_ior(last_err)))
+
+    def _set_raw(self, report_id, data):
+        buf = (c_uint8 * max(len(data), 1))(*data)
+        return _IOKIT.IOHIDDeviceSetReport(
+            self.dev, kIOHIDReportTypeFeature, report_id, buf, len(data)
+        )
+
+    def set_report(self, payload, verbose=False):
+        """Send a feature report. `payload` is [report_id, data...].
+
+        IMPORTANT (verified on this keyboard): macOS IOKit wants the WHOLE
+        report including the report ID byte inside the buffer, exactly like it
+        does for GetReport. Apple's headers claim the ID is a separate argument
+        and must be excluded from the data, and with that "documented" form the
+        calls return kIOReturnSuccess but the firmware silently ignores them
+        (the backlight never lights up).
+
+        The tell was that GetReport only accepted the full 23-byte buffer for
+        report 0x01 and echoed 0x01 at [0], while 22 bytes was rejected with
+        0xE00002E8.
+
+        So we try the full-report form first and fall back to the ID-separate
+        form only if that fails.
+        """
+        report_id, data = payload[0], payload[1:]
+        if self.set_convention == "in-buffer":
+            attempts = [("in-buffer", payload)]
+        elif self.set_convention == "separate":
+            attempts = [("separate", data)]
+        else:
+            attempts = [("in-buffer", payload), ("separate", data)]
+
+        last_err = None
+        for name, body in attempts:
+            rc = self._set_raw(report_id, body)
+            if verbose:
+                print("  SetReport id=0x{:02x} len={} [{}] -> {}".format(
+                    report_id, len(body), name, _describe_ior(rc)))
+            if rc == IORETURN_SUCCESS:
+                self.set_convention = name
+                return name
+            last_err = rc
+
+        raise RuntimeError("SetReport(0x{:02x}) failed: {}".format(
+            report_id, _describe_ior(last_err)))
+
+
+    def get_autonomous(self):
+        return self.get_report(CONTROL_REPORT_ID)[0]
+
+    # -- LampArray protocol ----------------------------------------------
+
+    def attributes(self, verbose=False):
+        rep = self.get_report(ATTR_REPORT_ID, ATTR_REPORT_SIZE, verbose=verbose)
+        # Payload layout (report ID already stripped):
+        #   LampCount(2) bboxW(4) bboxH(4) bboxD(4) kind(4) minInterval(4)
+        lamp_count = struct.unpack_from("<H", rep, 0)[0]
+        w, h, d, kind, interval = struct.unpack_from("<IIIII", rep, 2)
+        return {
+            "lamp_count": lamp_count,
+            "width": w,
+            "height": h,
+            "depth": d,
+            "kind": kind,
+            "min_interval": interval,
+        }
+
+    def set_autonomous(self, enabled):
+        self.set_report([CONTROL_REPORT_ID, 1 if enabled else 0])
+
+    def set_range(self, start, end, r, g, b, intensity=255, flags=0x01):
+        self.set_report(
+            [RANGE_REPORT_ID, flags]
+            + [start & 0xFF, start >> 8]
+            + [end & 0xFF, end >> 8]
+            + [r, g, b, intensity]
+        )
+
+    def apply_color(self, r, g, b, intensity, count):
+        # This device reports intensity_lvls=1, so the LampArray intensity
+        # channel is effectively on/off only. Emulate brightness steps by
+        # scaling the RGB values instead, exactly like the Linux tool does.
+        scale = max(0, min(255, intensity)) / 255.0
+        self.set_range(
+            0, count - 1,
+            round(r * scale), round(g * scale), round(b * scale),
+            255,
+        )
+
+    def set_color_and_auto(self, r, g, b, intensity, count, autonomous):
+        # Apply the color in host mode (autonomous off), then optionally hand
+        # control back to the firmware. The firmware does NOT store the host
+        # color: in autonomous mode it uses the color Windows GiMate last
+        # saved in the EC, which resets to off after a full power cycle.
+        self.set_autonomous(False)
+        self.apply_color(r, g, b, intensity, count)
+        if autonomous:
+            self.set_autonomous(True)
+
+
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
+
+
+def read_config():
+    cfg = {
+        "color": DEFAULT_COLOR,
+        "intensity": str(DEFAULT_INTENSITY),
+        "startup_color": STARTUP_COLOR,
+        "startup_intensity": str(STARTUP_INTENSITY),
+        "vendor_id": "{:04x}".format(VENDOR_ID),
+        "product_id": "",
+    }
+    try:
+        with open(CONFIG_PATH) as fh:
+            for line in fh:
+                line = line.strip()
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.split("=", 1)
+                    cfg[k.strip()] = v.strip()
+    except OSError:
+        pass
+    if os.environ.get("GIGABYTE_KBD_VID"):
+        cfg["vendor_id"] = os.environ["GIGABYTE_KBD_VID"]
+    if os.environ.get("GIGABYTE_KBD_PID"):
+        cfg["product_id"] = os.environ["GIGABYTE_KBD_PID"]
+    return cfg
+
+
+def write_config(color, intensity, startup_color=None, startup_intensity=None):
+    directory = os.path.dirname(CONFIG_PATH)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    cfg = read_config()
+    with open(CONFIG_PATH, "w") as fh:
+        fh.write("# GIGABYTE GAMING A16 keyboard backlight (macOS)\n")
+        fh.write("vendor_id={}\n".format(cfg.get("vendor_id") or "0414"))
+        fh.write("product_id={}\n".format(cfg.get("product_id", "")))
+        fh.write("color={}\n".format(color))
+        fh.write("intensity={}\n".format(intensity))
+        fh.write("startup_color={}\n".format(
+            startup_color if startup_color is not None else STARTUP_COLOR))
+        fh.write("startup_intensity={}\n".format(
+            startup_intensity
+            if startup_intensity is not None
+            else STARTUP_INTENSITY))
+
+
+def parse_color(hexc):
+    hexc = hexc.lstrip("#").lower()
+    if len(hexc) != 6:
+        sys.exit("Error: color must be RRGGBB (e.g. ffffff)")
+    try:
+        return (int(hexc[0:2], 16), int(hexc[2:4], 16),
+                int(hexc[4:6], 16), hexc)
+    except ValueError:
+        sys.exit("Error: color must be hexadecimal (e.g. ffffff)")
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+
+def cmd_detect(args):
+    if not args.list:
+        vid, pid = _wanted_ids()
+        kb = LampArray(vid, pid, wait=getattr(args, "wait", 0))
+        try:
+            print("{:04x} {:04x}".format(vid, _prop_int(kb.dev, "ProductID") or 0))
+        finally:
+            kb.close()
+        return
+
+    print("{:<12} {:<8} {:<8} {:<8} {:<10} {}".format(
+        "RegistryID", "VID", "PID", "UsagePg", "Usage", "Product"))
+    print("-" * 72)
+    any_found = False
+    for dev, service in iter_hid_devices():
+        vid = _prop_int(dev, "VendorID") or 0
+        pid = _prop_int(dev, "ProductID") or 0
+        up = _prop_int(dev, "PrimaryUsagePage")
+        us = _prop_int(dev, "PrimaryUsage")
+        product = _prop_str(dev, "Product") or ""
+        is_ours = (
+            vid == VENDOR_ID
+            and up == LAMPARRAY_USAGE_PAGE
+            and us == LAMPARRAY_USAGE
+        )
+        if args.gigabyte_only and vid != VENDOR_ID:
+            continue
+        any_found = True
+        print("{:<12} 0x{:<6x} 0x{:<6x} {:<8} {:<10} {}{}".format(
+            "0x{:x}".format(service), vid, pid,
+            "0x{:x}".format(up) if up is not None else "-",
+            us if us is not None else "-",
+            product, "   <== LampArray" if is_ours else ""))
+    if not any_found:
+        print("(no HID devices matched)")
+
+
+def cmd_info(args):
+    vid, pid = _wanted_ids()
+    with LampArray(vid, pid, verbose=args.debug, wait=getattr(args, "wait", 0)) as kb:
+        attrs = kb.attributes(verbose=args.debug)
+        kind = LAMP_KINDS.get(attrs["kind"], "Unknown")
+        print("Device:       {:04x}:{:04x} {}".format(
+            vid,
+            _prop_int(kb.dev, "ProductID") or 0,
+            _prop_str(kb.dev, "Product") or "",
+        ))
+        print("Transport:    {}".format(
+            _prop_str(kb.dev, "Transport") or "unknown"))
+        print("Lamp count:   {}".format(attrs["lamp_count"]))
+        print("Kind:         {} ({})".format(kind, attrs["kind"]))
+        print("Bounding box: {}x{}x{} um".format(
+            attrs["width"], attrs["height"], attrs["depth"]))
+        print("Min interval: {} us".format(attrs["min_interval"]))
+
+        if args.debug:
+            for key in ("MaxFeatureReportSize", "MaxInputReportSize",
+                        "MaxOutputReportSize", "VendorIDSource"):
+                val = _prop_int(kb.dev, key)
+                print("  {} = {}".format(key, val))
+            desc = _prop_data(kb.dev, "ReportDescriptor")
+            if desc:
+                print("  ReportDescriptor ({} bytes): {}".format(
+                    len(desc), desc[:24].hex()))
+
+
+def cmd_selftest(args):
+    """Read-only diagnostics plus a check of which report types the firmware
+    actually answers. Writes nothing."""
+    vid, pid = _wanted_ids()
+    kb = LampArray(vid, pid, verbose=args.debug, wait=getattr(args, "wait", 0)).open()
+    try:
+        print("1. LampArrayAttributes (report 0x01)")
+        attrs = kb.attributes(verbose=args.debug)
+        print("     LampCount    = {}".format(attrs["lamp_count"]))
+        print("     Kind         = {} ({})".format(
+            LAMP_KINDS.get(attrs["kind"], "Unknown"), attrs["kind"]))
+        print("     Bounding box = {}x{}x{} um".format(
+            attrs["width"], attrs["height"], attrs["depth"]))
+        print("     Min interval = {} us".format(attrs["min_interval"]))
+        if attrs["lamp_count"] == 0:
+            sys.exit("Error: device reports LampCount=0")
+
+        print("2. LampArrayControl (report 0x06) - GET support")
+        try:
+            cur = kb.get_autonomous()
+            print("     readable, AutonomousMode = {}".format(cur))
+        except RuntimeError as exc:
+            print("     not readable: {}".format(exc))
+            print("     (normal: many LampArray firmwares implement 0x06 as "
+                  "write-only)")
+
+        print("3. write path")
+        print("     SetReport is attempted by 'on' / 'color'. Buffer convention "
+              "is auto-detected.")
+        if kb.set_convention:
+            print("     forced via GIGABYTE_KBD_CONVENTION = {}".format(
+                kb.set_convention))
+        print()
+        print("RESULT: reads work, device is controllable.")
+        print("Next: run 'gigabyte-kbd on' and look at the keyboard.")
+    finally:
+        kb.close()
+
+
+def cmd_color(args):
+    r, g, b, hexc = parse_color(args.color)
+    vid, pid = _wanted_ids()
+    with LampArray(vid, pid, verbose=args.debug, wait=getattr(args, "wait", 0)) as kb:
+        count = max(kb.attributes()["lamp_count"], 1)
+        try:
+            kb.set_color_and_auto(r, g, b, args.intensity, count, args.auto)
+        except RuntimeError as exc:
+            sys.exit("Error: {}".format(exc))
+        write_config(hexc, args.intensity)
+        mode = "autonomous (Fn+Space works)" if args.auto else "host mode"
+        print("Set color #{} intensity={} ({}) on {} lamp(s)".format(
+            hexc, args.intensity, mode, count))
+
+
+def cmd_on(args):
+    ns = argparse.Namespace(color=DEFAULT_COLOR,
+                            intensity=DEFAULT_INTENSITY,
+                            auto=False, debug=getattr(args, "debug", False))
+    cmd_color(ns)
+
+
+def cmd_off(args):
+    cfg = read_config()
+    vid, pid = _wanted_ids()
+    with LampArray(vid, pid, verbose=getattr(args, "debug", False),
+                       wait=getattr(args, "wait", 0)) as kb:
+        count = max(kb.attributes()["lamp_count"], 1)
+        try:
+            kb.set_color_and_auto(0, 0, 0, 0, count, autonomous=False)
+        except RuntimeError as exc:
+            sys.exit("Error: {}".format(exc))
+        write_config(cfg.get("color", DEFAULT_COLOR), 0)
+        print("Backlight off")
+
+
+def cmd_restore(args):
+    cfg = read_config()
+    r, g, b, hexc = parse_color(cfg["color"])
+    intensity = int(cfg.get("intensity", DEFAULT_INTENSITY))
+    vid, pid = _wanted_ids()
+    with LampArray(vid, pid, verbose=getattr(args, "debug", False),
+                       wait=getattr(args, "wait", 0)) as kb:
+        count = max(kb.attributes()["lamp_count"], 1)
+        try:
+            kb.set_color_and_auto(r, g, b, intensity, count,
+                                  autonomous=args.auto)
+        except RuntimeError as exc:
+            sys.exit("Error: {}".format(exc))
+        mode = "autonomous (Fn+Space works)" if args.auto else "host mode"
+        print("Restored #{} intensity={} ({})".format(hexc, intensity, mode))
+
+
+def cmd_auto(args):
+    vid, pid = _wanted_ids()
+    with LampArray(vid, pid, verbose=getattr(args, "debug", False),
+                       wait=getattr(args, "wait", 0)) as kb:
+        try:
+            kb.set_autonomous(True)
+        except RuntimeError as exc:
+            sys.exit("Error: {}".format(exc))
+        print("Autonomous mode enabled (firmware color, Fn+Space cycles)")
+
+
+def cmd_startup(args):
+    cfg = read_config()
+    r, g, b, hexc = parse_color(cfg.get("startup_color", STARTUP_COLOR))
+    intensity = int(cfg.get("startup_intensity", STARTUP_INTENSITY))
+    vid, pid = _wanted_ids()
+    with LampArray(vid, pid, verbose=getattr(args, "debug", False),
+                       wait=getattr(args, "wait", 0)) as kb:
+        count = max(kb.attributes()["lamp_count"], 1)
+        try:
+            kb.set_color_and_auto(r, g, b, intensity, count, autonomous=False)
+        except RuntimeError as exc:
+            sys.exit("Error: {}".format(exc))
+        print("Startup #{} intensity={} (host mode)".format(hexc, intensity))
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Control GIGABYTE GAMING A16 RGB keyboard on macOS "
+                    "(HID LampArray via IOKit)"
+    )
+    parser.add_argument("--debug", action="store_true",
+                        help="show every feature report attempt and device props")
+    parser.add_argument("--wait", type=float, default=0.0, metavar="SECONDS",
+                        help="retry device detection for up to SECONDS (use at "
+                             "login, when USB may not be ready yet)")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_detect = sub.add_parser("detect", help="print detected VID/PID, or list devices")
+    p_detect.add_argument("--list", action="store_true",
+                          help="list all HID devices")
+    p_detect.add_argument("--gigabyte-only", action="store_true",
+                          help="with --list, only show GIGABYTE devices")
+
+    sub.add_parser("info", help="show lamp array attributes (read-only)")
+    sub.add_parser("selftest", help="verify read/write on control report (reversible)")
+    sub.add_parser("on", help="turn backlight on (white, full)")
+    sub.add_parser("off", help="turn backlight off")
+    sub.add_parser("auto", help="enable autonomous (firmware) mode, Fn+Space works")
+    sub.add_parser("startup", help="apply fixed startup color (default 00aaff)")
+
+    p_restore = sub.add_parser("restore", help="restore last saved color")
+    p_restore.add_argument("--auto", action="store_true",
+                           help="also enable autonomous mode")
+
+    p_color = sub.add_parser("color", help="set solid color (RRGGBB)")
+    p_color.add_argument("color", help="hex color, e.g. ffffff")
+    p_color.add_argument("--intensity", type=int, default=DEFAULT_INTENSITY,
+                         help="brightness 0-255 (default 255); emulated via RGB scaling")
+    p_color.add_argument("--auto", action="store_true",
+                         help="after setting the color, enable autonomous mode")
+
+    args = parser.parse_args()
+    handler = {
+        "detect": cmd_detect,
+        "info": cmd_info,
+        "selftest": cmd_selftest,
+        "on": cmd_on,
+        "off": cmd_off,
+        "color": cmd_color,
+        "restore": cmd_restore,
+        "auto": cmd_auto,
+        "startup": cmd_startup,
+    }[args.command]
+    handler(args)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.github.luminous418.gigabyte-a16-kbd</string>
+
+    <!-- Applied at every login. On a cold boot the EC forgets the colour,
+         so this is what actually turns the backlight back on. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>__TOOL__</string>
+        <string>--wait</string>
+        <string>20</string>
+        <string>startup</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Don't respawn: this is a one-shot command, not a daemon. -->
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>__LOG__</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG__</string>
+</dict>
+</plist>
